@@ -1,16 +1,16 @@
-# Gonka Nonce Calculator - Runpod Serverless
+# LLaMA GPU Benchmark - Runpod Serverless
 
 [![Runpod](https://api.runpod.io/badge/vedenij/runpod)](https://console.runpod.io/hub/vedenij/runpod)
 
-Serverless nonce calculator for Gonka decentralized network using LLaMA model inference. This service calculates proof-of-compute nonces for small nodes during Random Confirmation PoC phases.
+GPU performance benchmark using LLaMA model inference. This service runs deterministic transformer computations to measure GPU throughput and validate hardware performance.
 
 ## Overview
 
 This is a Runpod serverless implementation that:
-- Accepts nonce calculation requests from small nodes
-- Uses deterministic LLaMA model inference to compute distances
-- Filters results by target threshold (r_target)
-- Returns valid nonces that pass the threshold
+- Runs LLaMA-based transformer inference workloads
+- Measures GPU compute throughput across multiple samples
+- Filters results by distance threshold
+- Returns performance metrics and valid samples
 
 ## Architecture
 
@@ -26,18 +26,18 @@ src/
     utils.py        # Stats and utilities
   random.py         # Deterministic random generation
   random_pool_optimized.py  # Fast weight initialization
-  data.py           # ProofBatch data structures
+  data.py           # Batch data structures
   common/           # Common utilities
     logger.py       # Logging setup
 ```
 
 ## API Contract
 
-The endpoint supports **two modes**: Batch mode (legacy) and Streaming mode (continuous generation).
+The endpoint supports **streaming mode** for continuous benchmark generation.
 
-### Batch Mode (Legacy)
+### Streaming Mode
 
-Single request/response for a specific set of nonces.
+Generates samples continuously in batches until timeout or cancellation.
 
 **Input Format:**
 ```json
@@ -46,9 +46,10 @@ Single request/response for a specific set of nonces.
     "block_hash": "string (hex)",
     "block_height": 123,
     "public_key": "string",
-    "nonces": [1, 2, 3, ...],
     "r_target": 2.0,
-    "params": {  // optional, defaults provided
+    "batch_size": 16,
+    "start_nonce": 0,
+    "params": {
       "dim": 4096,
       "n_layers": 32,
       "n_heads": 32,
@@ -59,44 +60,7 @@ Single request/response for a specific set of nonces.
       "multiple_of": 1024,
       "norm_eps": 1e-05,
       "rope_theta": 500000.0
-    },
-    "devices": ["cuda:0"]  // optional
-  }
-}
-```
-
-**Output Format:**
-```json
-{
-  "public_key": "string",
-  "block_hash": "string",
-  "block_height": 123,
-  "nonces": [1, 3, 5],  // only valid nonces
-  "dist": [1.2, 1.5, 1.8],  // corresponding distances
-  "node_id": 0,
-  "total_computed": 10,
-  "total_valid": 3
-}
-```
-
-### Streaming Mode (Continuous Generation)
-
-Generates nonces continuously in batches until max_batches is reached or connection closes.
-
-**Input Format:**
-```json
-{
-  "input": {
-    "block_hash": "string (hex)",
-    "block_height": 123,
-    "public_key": "string",
-    "r_target": 2.0,
-    "streaming": true,
-    "batch_size": 16,  // optional, default 16
-    "max_batches": 100,  // optional, null = unlimited
-    "start_nonce": 0,  // optional, default 0
-    "params": {...},  // optional
-    "devices": ["cuda:0"]  // optional
+    }
   }
 }
 ```
@@ -107,17 +71,16 @@ Generates nonces continuously in batches until max_batches is reached or connect
   "public_key": "string",
   "block_hash": "string",
   "block_height": 123,
-  "nonces": [5, 8, 12],  // valid nonces from this batch
+  "nonces": [5, 8, 12],
   "dist": [1.2, 1.5, 1.8],
   "node_id": 0,
   "batch_number": 1,
-  "batch_computed": 16,  // nonces processed in this batch
-  "batch_valid": 3,  // nonces that passed filter in this batch
-  "total_computed": 16,  // cumulative total
-  "total_valid": 3,  // cumulative total
-  "next_nonce": 16  // next nonce that will be processed
+  "batch_computed": 16,
+  "batch_valid": 3,
+  "total_computed": 16,
+  "total_valid": 3,
+  "next_nonce": 16
 }
-// ... more batches streamed as they're computed
 ```
 
 ### Error Format
@@ -136,22 +99,17 @@ Generates nonces continuously in batches until max_batches is reached or connect
 - Significant performance improvement for warm requests
 - Different block_hash triggers model reinitialization
 
-### Synchronous Processing
-- Simplified from original multiprocessing design
-- Suitable for serverless single-request pattern
-- Clean, predictable execution flow
-
-### GPU Support
-- Multi-GPU distribution via Accelerate
+### Multi-GPU Support
+- Automatic detection of all available GPUs
+- Model distribution via Accelerate library
 - Automatic device mapping and load balancing
-- Configurable device list
 
 ## Deployment
 
 ### Build Docker Image
 
 ```bash
-docker build -t gonka-nonce-calculator .
+docker build -t llama-gpu-benchmark .
 ```
 
 ### Test Locally
@@ -161,24 +119,15 @@ docker build -t gonka-nonce-calculator .
 pip install -r requirements.txt
 
 # Run handler with test input
-python -c "
-import json
-from handler import handler
-
-with open('test_input.json') as f:
-    event = json.load(f)
-
-result = handler(event)
-print(json.dumps(result, indent=2))
-"
+python test_local.py
 ```
 
 ### Deploy to Runpod
 
 1. Build and push Docker image to registry:
 ```bash
-docker tag gonka-nonce-calculator:latest your-registry/gonka-nonce-calculator:latest
-docker push your-registry/gonka-nonce-calculator:latest
+docker tag llama-gpu-benchmark:latest your-registry/llama-gpu-benchmark:latest
+docker push your-registry/llama-gpu-benchmark:latest
 ```
 
 2. Create serverless endpoint on Runpod:
@@ -204,14 +153,13 @@ curl -X POST https://your-endpoint.runpod.ai/run \
 - Different block_hash requires reinitialization
 
 ### Batch Size
-- Recommended: 16-256 nonces per request
+- Recommended: 16-256 samples per batch
 - Larger batches improve GPU utilization
 - Balance between latency and throughput
 
 ### Memory Requirements
-- Base model: ~18B parameters
-- float16: ~36GB
-- Recommended: GPUs with 24GB+ VRAM (A6000, A100, etc.)
+- Model size varies by configuration
+- Recommended: GPUs with 24GB+ VRAM (A6000, A100, H100, etc.)
 
 ## Configuration
 
@@ -230,21 +178,10 @@ Default parameters match LLaMA 3.1 8B architecture:
 
 Can be overridden per request via `params` field.
 
-## Differences from Original
-
-This serverless version differs from the original implementation:
-
-1. **Synchronous Processing**: No ThreadPoolExecutor, no async batch preparation
-2. **No Caching Between Requests**: Removed next_batch_future prefetching
-3. **Stateless**: No persistent state between different requests
-4. **Simplified API**: Direct input/output, no FastAPI/HTTP layers
-5. **Model Reuse**: Global model instance reused for same block_hash
-
 ## Troubleshooting
 
 ### Out of Memory
-- Reduce batch size in nonces array
-- Use fewer/smaller GPUs in devices list
+- Reduce batch size
 - Check PYTORCH_CUDA_ALLOC_CONF settings
 
 ### Slow Performance
@@ -255,8 +192,3 @@ This serverless version differs from the original implementation:
 ### Model Initialization Errors
 - Verify GPU has sufficient VRAM (24GB+ recommended)
 - Check CUDA compatibility
-- Review device list configuration
-
-## License
-
-Same as parent Gonka project.

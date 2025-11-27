@@ -1,6 +1,6 @@
 {
-  "title": "Gonka Nonce Calculator",
-  "description": "Serverless nonce calculator for Gonka decentralized network using LLaMA model inference for Proof-of-Compute validation",
+  "title": "LLaMA GPU Benchmark",
+  "description": "GPU performance benchmark using LLaMA model inference for measuring compute throughput",
   "type": "serverless",
   "category": "language",
   "config": {
