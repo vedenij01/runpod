@@ -144,17 +144,16 @@ def warmup_handler(event: Dict[str, Any], callback_url: str, job_id: str):
             logger.info(f"Warmup got params after {elapsed:.0f}s, starting generation")
             yield {"status": "warmup_params_received", "elapsed": int(elapsed)}
 
-            # Get callback URL for results from params
-            results_callback_url = params.get("callback_url", "")
-            node_id = params.get("node_id", 0)
-
-            # Create event with received params and run generation with HTTP callback
+            # Create event with received params and run generation
+            # NOTE: Don't use HTTP callback (send_to_callback=False) because:
+            # 1. Runpod cannot access internal Docker URLs (http://api:9100)
+            # 2. DelegationController polls our /stream for results instead
             generation_event = {"input": params}
             yield from generation_handler(
                 generation_event,
-                send_to_callback=True,
-                callback_url=results_callback_url,
-                node_id=node_id,
+                send_to_callback=False,  # DelegationController polls us via /stream
+                callback_url="",
+                node_id=0,
                 warmup_job_id=job_id,
                 warmup_callback_url=callback_url,
             )
