@@ -78,39 +78,42 @@ def send_batch_to_callback(callback_url: str, batch: Dict[str, Any], node_id: in
         return False
 
 
+def notify_generation_complete(callback_url: str, job_id: str, stats: Dict[str, Any]) -> bool:
+    """
+    Notify MLNode that generation is complete so it can stop the warmup job.
+    """
+    try:
+        url = f"{callback_url}/warmup/complete"
+        payload = {
+            "job_id": job_id,
+            "total_batches": stats.get("total_batches", 0),
+            "total_computed": stats.get("total_computed", 0),
+            "total_valid": stats.get("total_valid", 0),
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        logger.info(f"Notified MLNode of generation complete: {stats}")
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to notify generation complete: {e}")
+        return False
+
+
 def warmup_handler(event: Dict[str, Any], callback_url: str, job_id: str):
     """
-    Warmup mode handler - initializes CUDA and waits for params.
+    Warmup mode handler - reserves worker and waits for params.
 
-    1. Initialize CUDA/PyTorch
-    2. Poll callback_url for generation params
-    3. When params received, run normal generation
+    IMPORTANT: Does NOT initialize CUDA early - that causes 5min slowdown!
+    Just polls for params, then runs normal generation (which initializes CUDA).
+
+    1. Poll callback_url for generation params
+    2. When params received, run normal generation
     """
-    import torch
-
     logger.info(f"WARMUP MODE: job_id={job_id}, callback_url={callback_url}")
-
-    # Initialize CUDA
-    logger.info("Initializing CUDA...")
-    cuda_start = time.time()
-
-    gpu_count = torch.cuda.device_count()
-    if gpu_count == 0:
-        yield {"error": "No GPUs available", "error_type": "NotEnoughGPUResources", "fatal": True}
-        return
-
-    # Warm up each GPU
-    for i in range(gpu_count):
-        torch.cuda.set_device(i)
-        # Small tensor allocation to initialize CUDA context
-        _ = torch.zeros(1, device=f"cuda:{i}")
-
-    logger.info(f"CUDA initialized in {time.time() - cuda_start:.1f}s, {gpu_count} GPUs available")
+    logger.info("Worker reserved, waiting for generation params (no CUDA init)")
 
     yield {
         "status": "warmup_ready",
-        "cuda_initialized": True,
-        "gpu_count": gpu_count,
         "job_id": job_id,
     }
 
@@ -128,7 +131,8 @@ def warmup_handler(event: Dict[str, Any], callback_url: str, job_id: str):
             return
 
         poll_count += 1
-        logger.info(f"Warmup poll #{poll_count}: checking for params...")
+        if poll_count % 12 == 1:  # Log every minute (12 * 5s = 60s)
+            logger.info(f"Warmup poll #{poll_count}: waiting for params... ({int(elapsed)}s)")
 
         params = fetch_warmup_params(callback_url, job_id)
 
@@ -147,6 +151,8 @@ def warmup_handler(event: Dict[str, Any], callback_url: str, job_id: str):
                 send_to_callback=True,
                 callback_url=results_callback_url,
                 node_id=node_id,
+                warmup_job_id=job_id,
+                warmup_callback_url=callback_url,
             )
             return
 
@@ -165,6 +171,8 @@ def generation_handler(
     send_to_callback: bool = False,
     callback_url: str = "",
     node_id: int = 0,
+    warmup_job_id: str = "",
+    warmup_callback_url: str = "",
 ):
     """
     Parallel streaming nonce generator using multiple GPU groups.
@@ -192,6 +200,8 @@ def generation_handler(
         send_to_callback: If True, send results via HTTP to callback_url
         callback_url: URL to send results to (used in warmup mode)
         node_id: Node ID to include in batches sent to callback
+        warmup_job_id: Job ID for warmup mode (to notify completion)
+        warmup_callback_url: Callback URL for warmup completion notification
 
     Yields:
     {
@@ -358,6 +368,14 @@ def generation_handler(
 
         logger.info(f"STOPPED: {aggregated_batch_count} batches, {total_computed} computed, {total_valid} valid")
         manager.stop()
+
+        # Notify MLNode that generation is complete (for warmup mode auto-stop)
+        if warmup_job_id and warmup_callback_url:
+            notify_generation_complete(warmup_callback_url, warmup_job_id, {
+                "total_batches": aggregated_batch_count,
+                "total_computed": total_computed,
+                "total_valid": total_valid,
+            })
 
         # Free GPU 0 memory - delete base model data after all workers done
         logger.info("Freeing GPU 0 memory...")
