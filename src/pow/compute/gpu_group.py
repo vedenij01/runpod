@@ -1,10 +1,31 @@
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 import torch
 from pow.models.utils import PARAMS_V1, PARAMS_V2, Params
 from common.logger import create_logger
 
 logger = create_logger(__name__)
+
+# Lazy import to avoid circular dependency
+_gpu_arch_module = None
+
+
+def _get_gpu_architecture(device_id: int = 0):
+    """Lazy import of gpu_arch module to avoid circular imports."""
+    global _gpu_arch_module
+    if _gpu_arch_module is None:
+        from pow.compute import gpu_arch
+        _gpu_arch_module = gpu_arch
+    return _gpu_arch_module.get_gpu_architecture(device_id)
+
+
+def _is_blackwell_gpu(device_id: int = 0) -> bool:
+    """Check if running on Blackwell GPU."""
+    global _gpu_arch_module
+    if _gpu_arch_module is None:
+        from pow.compute import gpu_arch
+        _gpu_arch_module = gpu_arch
+    return _gpu_arch_module.is_blackwell_gpu(device_id)
 
 # Retry settings for CUDA availability check at startup
 CUDA_RETRY_ATTEMPTS = 5
@@ -16,13 +37,41 @@ class NotEnoughGPUResources(Exception):
     pass
 
 
-def get_min_group_vram(params: Params) -> float:
+def get_min_group_vram(params: Params, device_id: int = 0) -> float:
+    """
+    Get minimum VRAM required per group, adjusted for GPU architecture.
+
+    Blackwell GPUs can use memory more efficiently due to TMEM (Tensor Memory),
+    so we can reduce the threshold slightly.
+
+    Args:
+        params: Model parameters
+        device_id: GPU device ID for architecture detection
+
+    Returns:
+        Minimum VRAM in GB required for the GPU group
+    """
     if params == PARAMS_V1:
-        return 10.0
+        base_vram = 10.0
     elif params == PARAMS_V2:
-        return 38.0
+        base_vram = 38.0
     else:
-        return 38.0
+        base_vram = 38.0
+
+    # Blackwell GPUs have more efficient memory management with TMEM
+    try:
+        if torch.cuda.is_available() and _is_blackwell_gpu(device_id):
+            # Blackwell can operate with ~15% less VRAM requirement
+            adjusted_vram = base_vram * 0.85
+            logger.debug(
+                f"Blackwell GPU detected: reduced VRAM threshold from "
+                f"{base_vram:.1f}GB to {adjusted_vram:.1f}GB"
+            )
+            return adjusted_vram
+    except Exception as e:
+        logger.debug(f"Could not detect GPU architecture: {e}")
+
+    return base_vram
 
 
 class GpuGroup:

@@ -59,6 +59,9 @@ class ModelArgs:
 
     seq_len: int = 16
 
+    # FP8 support for Blackwell GPUs (B200)
+    use_fp8: bool = False
+
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             if hasattr(self, k):
@@ -592,6 +595,58 @@ def sample_top_p(probs, p, generator):
     next_token = torch.multinomial(probs_sort, num_samples=1, generator=generator)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
+
+
+# -----------------------------------------------------------------------------
+# FP8 support for Blackwell GPUs
+
+def convert_transformer_to_fp8(model: Transformer) -> Transformer:
+    """
+    Convert transformer model to use FP8 weight storage for Blackwell GPUs.
+
+    This converts Linear layers to use FP8 E4M3 format for weights,
+    which saves memory and enables FP8 tensor core operations on Blackwell.
+
+    Args:
+        model: Transformer model to convert
+
+    Returns:
+        Model with FP8 linear layers (if FP8 is available)
+    """
+    try:
+        from pow.compute.fp8_utils import convert_model_to_fp8, FP8Config, is_fp8_available
+
+        if not is_fp8_available():
+            logger.warning("FP8 not available in PyTorch, skipping FP8 conversion")
+            return model
+
+        fp8_config = FP8Config(enabled=True)
+        model = convert_model_to_fp8(model, fp8_config)
+        logger.info("Successfully converted model to FP8")
+
+    except ImportError as e:
+        logger.warning(f"Could not import FP8 utilities: {e}")
+    except Exception as e:
+        logger.warning(f"FP8 conversion failed: {e}, using original model")
+
+    return model
+
+
+def maybe_convert_to_fp8(model: Transformer, use_fp8: bool = False) -> Transformer:
+    """
+    Optionally convert model to FP8 based on configuration.
+
+    Args:
+        model: Transformer model
+        use_fp8: Whether to enable FP8 conversion
+
+    Returns:
+        Model (possibly converted to FP8)
+    """
+    if not use_fp8:
+        return model
+
+    return convert_transformer_to_fp8(model)
 
 # -----------------------------------------------------------------------------
 # distributed and sharded data loader

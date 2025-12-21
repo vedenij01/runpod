@@ -274,6 +274,23 @@ class Compute(BaseCompute):
         ).result()
         return proof_batch
 
+    def update_public_key(self, new_public_key: str):
+        """
+        Update public_key without recreating model.
+
+        Model weights depend only on block_hash, not public_key.
+        Only inputs and permutations change with public_key.
+
+        This method:
+        1. Updates the stored public_key
+        2. Invalidates pre-fetch cache (bound to old public_key)
+        """
+        self.public_key = new_public_key
+
+        # Invalidate pre-fetch cache - it was generated with old public_key
+        self.next_batch_future = None
+        self.next_public_key = None
+
     def shutdown(self):
         """Shutdown the executor"""
         self.executor.shutdown(wait=False)

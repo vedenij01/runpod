@@ -34,8 +34,11 @@ class ModelWrapper(torch.nn.Module):
     def forward(self, inputs: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         with torch.no_grad():
             with self.stats.time_infer():
+                # Get device and dtype from model weights
                 device = self.module.layers[0].attention.wq.weight.device
-                inputs = inputs.to(device)
+                dtype = self.module.layers[0].attention.wq.weight.dtype
+                # Convert inputs to match model's device and dtype
+                inputs = inputs.to(device=device, dtype=dtype)
                 return self.module(inputs, **kwargs)
 
     @staticmethod

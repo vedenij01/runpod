@@ -23,6 +23,9 @@ class Params:
 
     seq_len: int = 16
 
+    # FP8 support for Blackwell GPUs (B200)
+    use_fp8: bool = False
+
 
 PARAMS_V1 = Params(
     dim=1024,
@@ -91,3 +94,35 @@ def set_default_dtype(
     else:
         logger.warning(f"Unsupported dtype {dtype}, falling back to float16")
         torch.set_default_dtype(torch.float16)
+
+
+def get_params_with_fp8(params: Params, enable_fp8: bool = False) -> Params:
+    """
+    Return params with FP8 setting based on GPU architecture.
+
+    For Blackwell GPUs (B200), enables FP8 for ~2x performance improvement.
+
+    Args:
+        params: Base model parameters
+        enable_fp8: Whether to enable FP8 (typically set based on GPU detection)
+
+    Returns:
+        Params with use_fp8 field set appropriately
+    """
+    if enable_fp8 and not params.use_fp8:
+        # Create new params with FP8 enabled
+        return Params(
+            dim=params.dim,
+            n_layers=params.n_layers,
+            n_heads=params.n_heads,
+            n_kv_heads=params.n_kv_heads,
+            vocab_size=params.vocab_size,
+            ffn_dim_multiplier=params.ffn_dim_multiplier,
+            multiple_of=params.multiple_of,
+            norm_eps=params.norm_eps,
+            rope_theta=params.rope_theta,
+            use_scaled_rope=params.use_scaled_rope,
+            seq_len=params.seq_len,
+            use_fp8=True,
+        )
+    return params

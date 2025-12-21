@@ -7,7 +7,7 @@
     "runsOn": "GPU",
     "containerDiskInGb": 50,
     "gpuCount": 1,
-    "allowedCudaVersions": ["12.4", "12.1", "11.8"],
+    "allowedCudaVersions": ["12.8", "12.4", "12.1", "11.8"],
     "env": [
       {
         "name": "LOG_LEVEL",
@@ -20,6 +20,13 @@
         "type": "string",
         "default": "max_split_size_mb:512",
         "description": "PyTorch CUDA memory allocator configuration",
+        "advanced": true
+      },
+      {
+        "name": "BENCHMARK_FALLBACK_MODE",
+        "type": "string",
+        "default": "0",
+        "description": "Set to 1 to disable architecture-specific optimizations (FP8, etc.)",
         "advanced": true
       }
     ]

@@ -1,5 +1,6 @@
-# Use official PyTorch image with CUDA 12.4 (closest to 12.6)
-FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
+# Use official PyTorch image with CUDA 12.8 for Blackwell (B200) support
+# Also compatible with Hopper (H100/H200) architecture
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
 
 # Set working directory
 WORKDIR /app

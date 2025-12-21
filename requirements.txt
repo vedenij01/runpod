@@ -1,8 +1,9 @@
 # Core dependencies
-torch>=2.4.1
+torch>=2.7.0  # Required for Blackwell (SM100) support
 numpy>=2.1.1
 scipy>=1.14.1
-accelerate>=0.26.0
+accelerate>=0.33.0  # Updated for Blackwell compatibility
+triton>=3.3.0  # Required for Blackwell tensor cores
 
 # Runpod SDK
 runpod

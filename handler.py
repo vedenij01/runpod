@@ -13,9 +13,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from pow.compute.gpu_group import create_gpu_groups, GpuGroup, NotEnoughGPUResources
 from pow.compute.autobs_v2 import get_batch_size_for_gpu_group
-from pow.compute.worker import ParallelWorkerManager
+from pow.compute.worker import ParallelWorkerManager, PooledWorkerManager
 from pow.compute.model_init import ModelWrapper
-from pow.models.utils import Params
+from pow.compute.orchestrator_client import OrchestratorClient
+from pow.compute.gpu_arch import (
+    get_gpu_architecture,
+    get_architecture_config,
+    GPUArchitecture,
+    should_use_fallback_mode,
+)
+from pow.models.utils import Params, get_params_with_fp8
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +34,11 @@ MAX_JOB_DURATION = 7 * 60
 # Warmup polling interval
 WARMUP_POLL_INTERVAL = 5  # seconds
 WARMUP_MAX_DURATION = 10 * 60  # 10 minutes max warmup time
+
+# Pooled mode settings
+POOLED_POLL_INTERVAL = 0.5  # 500ms - how often to poll orchestrator for commands
+POOLED_MAX_DURATION = 10 * 60  # 10 minutes max session duration
+POOLED_MODEL_LOAD_TIMEOUT = 300  # 5 minutes max for model loading
 
 # Global flag to track if CUDA is broken - prevents repeated failed attempts
 _cuda_broken = False
@@ -242,10 +254,39 @@ def generation_handler(
 
         params = Params(**params_dict)
 
-        # Auto-detect GPUs and create groups
+        # Auto-detect GPUs and architecture
         import torch
         gpu_count = torch.cuda.device_count()
         logger.info(f"Detected {gpu_count} GPUs")
+
+        # Detect GPU architecture for optimizations
+        recommended_dtype = torch.float16  # default
+        try:
+            gpu_caps = get_gpu_architecture(0)
+            arch_config = get_architecture_config(0)
+            recommended_dtype = gpu_caps.recommended_dtype
+            logger.info(
+                f"GPU Architecture: {gpu_caps.device_name} "
+                f"({gpu_caps.architecture.value}, SM{gpu_caps.compute_capability[0]}{gpu_caps.compute_capability[1]})"
+            )
+            logger.info(
+                f"  Memory: {gpu_caps.total_memory_gb:.1f}GB, "
+                f"FP8: {gpu_caps.supports_fp8}, BF16: {gpu_caps.supports_bfloat16}, "
+                f"dtype: {recommended_dtype}"
+            )
+
+            # Enable FP8 for Blackwell GPUs
+            use_fp8 = arch_config.get("use_fp8", False)
+            if use_fp8 and gpu_caps.architecture == GPUArchitecture.BLACKWELL:
+                logger.info("Blackwell GPU detected - enabling FP8 optimizations")
+                params = get_params_with_fp8(params, enable_fp8=True)
+
+            # Check for fallback mode
+            if should_use_fallback_mode():
+                logger.warning("Fallback mode enabled - using conservative settings")
+
+        except Exception as e:
+            logger.warning(f"Could not detect GPU architecture: {e}, using defaults")
 
         # Create GPU groups based on VRAM requirements
         gpu_groups = create_gpu_groups(params=params)
@@ -275,12 +316,13 @@ def generation_handler(
         gpu_group_devices = [group.get_device_strings() for group in gpu_groups]
 
         # Build base model ONCE on GPU 0 (this is the slow part)
-        logger.info("Building base model on GPU 0...")
+        logger.info(f"Building base model on GPU 0 with dtype={recommended_dtype}...")
         base_model_start = time.time()
         base_model_data = ModelWrapper.build_base_model(
             hash_=block_hash,
             params=params,
             max_seq_len=params.seq_len,
+            dtype=recommended_dtype,
         )
         logger.info(f"Base model built in {time.time() - base_model_start:.1f}s")
 
@@ -426,9 +468,309 @@ def generation_handler(
             pass
 
 
+def pooled_handler(event: Dict[str, Any]):
+    """
+    Pooled mode handler - worker managed by external orchestrator.
+
+    This mode supports:
+    1. Registration with orchestrator (reports GPU count)
+    2. Waiting for block_hash to load model
+    3. Dynamic public_key switching without model reload
+    4. Range-based nonce distribution
+    5. Results tagged with public_key for routing
+
+    Input:
+    {
+        "mode": "pooled",
+        "orchestrator_url": "https://orchestrator.example.com"
+    }
+
+    Flow:
+    1. Connect to orchestrator, register with GPU info
+    2. Wait for block_hash from orchestrator
+    3. Load model (slow, ~30-60s)
+    4. Notify orchestrator that we're ready
+    5. Receive public_key and nonce range, start computing
+    6. On switch_job command: flush results, switch public_key, reset nonces
+    7. On shutdown command: flush results, cleanup, exit
+    """
+    global _cuda_broken
+
+    if _cuda_broken:
+        logger.error("CUDA already marked as broken - killing worker immediately")
+        yield {"error": "Worker CUDA is broken", "error_type": "NotEnoughGPUResources", "fatal": True}
+        os._exit(1)
+
+    input_data = event.get("input", {})
+    orchestrator_url = input_data.get("orchestrator_url", "")
+
+    if not orchestrator_url:
+        yield {"error": "orchestrator_url is required for pooled mode", "error_type": "ValueError"}
+        return
+
+    # Initialize orchestrator client (generates UUID for worker_id)
+    client = OrchestratorClient(orchestrator_url)
+    worker_id = client.worker_id
+
+    logger.info(f"POOLED MODE: worker_id={worker_id}, orchestrator={orchestrator_url}")
+
+    try:
+        import torch
+
+        # Step 1: Detect GPUs
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"Detected {gpu_count} GPUs")
+
+        if gpu_count == 0:
+            yield {"error": "No GPUs detected", "error_type": "NotEnoughGPUResources", "fatal": True}
+            return
+
+        # Step 2: Register with orchestrator
+        yield {"status": "registering", "worker_id": worker_id, "gpu_count": gpu_count}
+
+        reg_response = client.register(gpu_count)
+        if reg_response.get("status") == "error":
+            yield {"error": "Failed to register with orchestrator", "error_type": "ConnectionError"}
+            return
+
+        yield {"status": "registered", "worker_id": worker_id}
+
+        # Step 3: Wait for block_hash
+        logger.info("Waiting for block_hash from orchestrator...")
+        yield {"status": "waiting_block_hash"}
+
+        config = None
+        wait_start = time.time()
+
+        while not client.current_config.block_hash:
+            if time.time() - wait_start > POOLED_MAX_DURATION:
+                logger.warning("Timeout waiting for block_hash")
+                yield {"status": "timeout", "message": "No block_hash received"}
+                client.notify_shutdown({"reason": "timeout_waiting_block_hash"})
+                return
+
+            config = client.poll_config()
+            if config and config.get("type") == "shutdown":
+                logger.info("Received shutdown before block_hash")
+                yield {"status": "shutdown"}
+                return
+
+            time.sleep(1)
+
+        block_hash = client.current_config.block_hash
+        params_dict = client.current_config.params
+        logger.info(f"Received block_hash: {block_hash[:16]}...")
+
+        yield {"status": "received_block_hash", "block_hash": block_hash[:16]}
+
+        # Step 4: Create GPU groups and load model
+        yield {"status": "loading_model"}
+
+        params = Params(**params_dict)
+        gpu_groups = create_gpu_groups(params=params)
+        n_workers = len(gpu_groups)
+
+        logger.info(f"Created {n_workers} GPU groups")
+        for i, group in enumerate(gpu_groups):
+            logger.info(f"  Worker {i}: {group} (VRAM: {group.get_total_vram_gb():.1f}GB)")
+
+        # Calculate batch size
+        batch_sizes = [get_batch_size_for_gpu_group(group, params) for group in gpu_groups]
+        batch_size_per_worker = min(batch_sizes)
+        logger.info(f"Batch size per worker: {batch_size_per_worker}")
+
+        # Build base model on GPU 0
+        logger.info("Building base model on GPU 0...")
+        model_start = time.time()
+        base_model_data = ModelWrapper.build_base_model(
+            hash_=block_hash,
+            params=params,
+            max_seq_len=params.seq_len,
+        )
+        logger.info(f"Base model built in {time.time() - model_start:.1f}s")
+
+        yield {"status": "model_loaded", "load_time": int(time.time() - model_start)}
+
+        # Step 5: Notify orchestrator we're ready and get job config
+        ready_response = client.notify_model_loaded()
+
+        if ready_response.get("status") == "error":
+            logger.error("Failed to notify ready")
+            yield {"error": "Failed to notify ready", "error_type": "ConnectionError"}
+            return
+
+        # Get initial job configuration
+        public_key = client.current_config.public_key
+        range_start = client.current_config.nonce_range_start
+        range_end = client.current_config.nonce_range_end
+        r_target = client.current_config.r_target
+        block_height = client.current_config.block_height
+
+        logger.info(f"Ready to compute: public_key={public_key[:16] if public_key else 'None'}..., range={range_start}-{range_end}")
+
+        yield {"status": "ready", "public_key": public_key[:16] if public_key else None}
+
+        # Step 6: Create pooled worker manager
+        gpu_group_devices = [group.get_device_strings() for group in gpu_groups]
+
+        manager = PooledWorkerManager(
+            params=params,
+            block_hash=block_hash,
+            block_height=block_height,
+            r_target=r_target,
+            batch_size_per_worker=batch_size_per_worker,
+            gpu_groups=gpu_group_devices,
+            range_start=range_start,
+            range_end=range_end,
+            max_duration=POOLED_MAX_DURATION,
+            base_model_data=base_model_data,
+        )
+
+        manager.start()
+
+        if not manager.wait_for_ready(timeout=POOLED_MODEL_LOAD_TIMEOUT):
+            logger.error("Pooled workers failed to initialize")
+            yield {"error": "Worker initialization timeout", "error_type": "TimeoutError"}
+            manager.stop()
+            return
+
+        # Set initial public_key if we have one
+        if public_key:
+            manager.set_public_key(public_key)
+
+        logger.info("All pooled workers ready, starting compute loop")
+        yield {"status": "computing"}
+
+        # Step 7: Main compute loop
+        session_start = time.time()
+        total_batches_sent = 0
+        last_poll_time = time.time()
+
+        while True:
+            elapsed = time.time() - session_start
+
+            # Check session timeout
+            if elapsed > POOLED_MAX_DURATION:
+                logger.info(f"Session timeout after {elapsed:.0f}s")
+                break
+
+            # Check if all workers stopped
+            if not manager.is_alive():
+                logger.info("All workers have stopped")
+                break
+
+            # Poll orchestrator for commands (every POOLED_POLL_INTERVAL)
+            if time.time() - last_poll_time >= POOLED_POLL_INTERVAL:
+                last_poll_time = time.time()
+                command = client.poll_config()
+
+                if command:
+                    cmd_type = command.get("type")
+
+                    if cmd_type == "switch_job":
+                        # Flush pending results before switching
+                        pending_results = manager.get_all_pending_results()
+                        for result in pending_results:
+                            client.send_result(result)
+                            total_batches_sent += 1
+
+                        # Switch to new public_key
+                        new_public_key = command.get("public_key")
+                        if new_public_key:
+                            manager.switch_public_key(new_public_key)
+                            logger.info(f"Switched to public_key: {new_public_key[:16]}...")
+                            yield {
+                                "status": "switched_public_key",
+                                "public_key": new_public_key[:16],
+                            }
+
+                    elif cmd_type == "shutdown":
+                        logger.info("Received shutdown command")
+                        break
+
+                    elif cmd_type == "compute" and command.get("public_key"):
+                        # New job assignment (initial or after waiting)
+                        new_public_key = command.get("public_key")
+                        manager.set_public_key(new_public_key)
+                        logger.info(f"Set public_key: {new_public_key[:16]}...")
+
+            # Collect and send results
+            results = manager.get_results(timeout=0.1)
+
+            for result in results:
+                if "error" in result:
+                    logger.error(f"Worker {result.get('worker_id')} error: {result['error']}")
+                    yield result
+                    continue
+
+                # Send to orchestrator (buffered with retry)
+                client.send_result(result)
+                total_batches_sent += 1
+
+                # Yield for RunPod streaming
+                yield result
+
+            # Small sleep to prevent busy loop
+            time.sleep(0.01)
+
+        # Step 8: Cleanup
+        logger.info(f"Session ended: {total_batches_sent} batches sent, pending={client.get_pending_count()}")
+
+        # Flush any remaining results
+        pending_results = manager.get_all_pending_results()
+        for result in pending_results:
+            client.send_result(result)
+            total_batches_sent += 1
+
+        manager.stop()
+
+        # Notify orchestrator of shutdown
+        client.notify_shutdown({
+            "total_batches_sent": total_batches_sent,
+            "session_duration": int(time.time() - session_start),
+        })
+
+        yield {
+            "status": "shutdown",
+            "total_batches_sent": total_batches_sent,
+            "session_duration": int(time.time() - session_start),
+        }
+
+        # Free GPU memory
+        del base_model_data
+        torch.cuda.empty_cache()
+
+    except NotEnoughGPUResources as e:
+        _cuda_broken = True
+        logger.error(f"GPU INIT FAILED: {str(e)}")
+        yield {"error": str(e), "error_type": "NotEnoughGPUResources", "fatal": True}
+        client.notify_shutdown({"error": str(e)})
+        os._exit(1)
+
+    except Exception as e:
+        logger.error(f"POOLED ERROR: {str(e)}", exc_info=True)
+        yield {"error": str(e), "error_type": type(e).__name__}
+        try:
+            client.notify_shutdown({"error": str(e)})
+        except:
+            pass
+
+    finally:
+        try:
+            client.close()
+        except:
+            pass
+
+
 def handler(event: Dict[str, Any]):
     """
-    Main handler - dispatches to warmup or generation mode.
+    Main handler - dispatches to pooled, warmup, or generation mode.
+
+    Pooled mode input (orchestrator-managed):
+    {
+        "mode": "pooled",
+        "orchestrator_url": "https://orchestrator.example.com"
+    }
 
     Warmup mode input:
     {
@@ -444,6 +786,14 @@ def handler(event: Dict[str, Any]):
     }
     """
     input_data = event.get("input", {})
+    mode = input_data.get("mode", "")
+
+    # Check for pooled mode first
+    if mode == "pooled":
+        yield from pooled_handler(event)
+        return
+
+    # Legacy modes
     warmup_mode = input_data.get("warmup_mode", False)
 
     if warmup_mode:
