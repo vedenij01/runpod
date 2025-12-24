@@ -509,10 +509,27 @@ def pooled_worker_thread(
                 next_nonces=next_nonces if next_nonces else None,
             )
 
-            # Put back pre-fetched nonces if we didn't use them
-            # (they're already consumed from iterator, but that's ok for pooled mode)
+            # Wait for result while checking for commands (reduces switch latency)
+            pending_switch = None
+            while not future.done():
+                try:
+                    command = command_queue.get_nowait()
+                    cmd_type = command.get("type")
 
-            # Get result
+                    if cmd_type == "switch_public_key":
+                        # Queue the switch for after current batch completes
+                        pending_switch = command
+                        logger.info(f"[PooledWorker {worker_id}] Switch queued, will apply after current batch")
+                    elif cmd_type == "set_public_key":
+                        pending_switch = command
+                    elif cmd_type == "stop":
+                        logger.info(f"[PooledWorker {worker_id}] Stop received during batch, will exit after")
+                        stop_event.set()
+                except queue.Empty:
+                    pass
+                time.sleep(0.01)  # 10ms - don't busy-wait
+
+            # Get result (now ready)
             proof_batch = future.result()
             filtered_batch = proof_batch.sub_batch(r_target)
 
@@ -547,6 +564,22 @@ def pooled_worker_thread(
                 result_queue.put(result, timeout=1)
             except queue.Full:
                 logger.warning(f"[PooledWorker {worker_id}] Queue full, dropping batch")
+
+            # Apply pending switch AFTER sending result with current public_key
+            if pending_switch:
+                cmd_type = pending_switch.get("type")
+                new_public_key = pending_switch["public_key"]
+                current_public_key = new_public_key
+                compute.update_public_key(current_public_key)
+
+                if cmd_type == "switch_public_key":
+                    nonce_iter.reset()
+                    batch_count = 0
+                    total_computed = 0
+                    total_valid = 0
+                    logger.info(f"[PooledWorker {worker_id}] Switched to public_key: {current_public_key[:16]}..., nonces reset")
+                else:
+                    logger.info(f"[PooledWorker {worker_id}] Set public_key: {current_public_key[:16]}...")
 
             if batch_count % 10 == 0:
                 logger.info(
