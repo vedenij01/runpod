@@ -83,8 +83,8 @@ def get_gpu_architecture(device_id: int = 0) -> GPUCapabilities:
             # RTX PRO 6000 - lower memory bandwidth than datacenter GPUs
             max_batch_multiplier = 0.7
         else:
-            # B200 and datacenter GPUs - use same baseline as H100
-            max_batch_multiplier = 1.0
+            # B200 and datacenter GPUs
+            max_batch_multiplier = 0.8
 
     elif cc[0] == 9:
         # Hopper: SM90 (H100, H200)
@@ -96,10 +96,8 @@ def get_gpu_architecture(device_id: int = 0) -> GPUCapabilities:
         supports_flash_attention = True
         recommended_dtype = torch.bfloat16
 
-        if total_memory_gb > 100:
-            max_batch_multiplier = 1.5  # H200 (141GB)
-        else:
-            max_batch_multiplier = 1.0  # H100 (80GB) - baseline
+        # Same batch multiplier for all Hopper GPUs (H100, H200)
+        max_batch_multiplier = 0.8
 
     elif cc[0] == 8:
         # Ampere: SM80 (A100)

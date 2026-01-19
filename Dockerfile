@@ -2,6 +2,10 @@
 # Also compatible with Hopper (H100/H200) architecture
 FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
 
+# Cache bust - change this value to force rebuild without cache
+ARG CACHE_VERSION=2025-01-18-v1
+RUN echo "Cache version: $CACHE_VERSION"
+
 # Set working directory
 WORKDIR /app
 
